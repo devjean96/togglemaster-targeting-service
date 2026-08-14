@@ -45,6 +45,18 @@ Este é o serviço de regras de segmentação (targeting) do projeto ToggleMaste
     ```
     O servidor estará rodando em `http://localhost:8003`.
 
+## ✅ Qualidade e testes
+
+```bash
+pip install -r requirements-dev.txt
+ruff check .
+pytest
+docker build -t togglemaster-targeting-service .
+```
+
+O workflow `.github/workflows/ci.yml` executa lint, testes unitários com cobertura mínima
+de 90% e, após essas verificações, valida o build da imagem Docker.
+
 ## 🧪 Testando os Endpoints
 
 Lembre-se de obter sua `SUA_CHAVE_API` no `auth-service` (veja o README do `flag-service`).
