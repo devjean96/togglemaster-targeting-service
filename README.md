@@ -104,3 +104,13 @@ curl -X PUT http://localhost:8003/rules/enable-new-dashboard \
 ```
 Saída esperada: (O JSON da regra atualizada, com `"value": 75`).
 
+## OpenTelemetry e New Relic APM
+
+O SDK é inicializado por worker Gunicorn. Flask, Requests e Psycopg2 são
+instrumentados automaticamente; criação, consulta, atualização e exclusão de
+regras possuem spans e métricas de negócio. O JSON das regras, dados de usuários
+e headers de autorização não são registrados como atributos.
+
+Endpoint OTLP, sampling, propagadores e `service.version` são fornecidos pelo
+ConfigMap/Deployment GitOps.
+

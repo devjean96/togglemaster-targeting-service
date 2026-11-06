@@ -8,6 +8,10 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from functools import wraps
 import logging
+from opentelemetry import metrics, trace
+from opentelemetry.trace import Status, StatusCode
+
+from telemetry import init_telemetry
 
 # Configura o logging
 logging.basicConfig(level=logging.INFO)
@@ -17,6 +21,20 @@ log = logging.getLogger(__name__)
 load_dotenv()
 
 app = Flask(__name__)
+init_telemetry(app, default_service_name="targeting-service")
+
+tracer = trace.get_tracer("togglemaster/targeting-service")
+meter = metrics.get_meter("togglemaster/targeting-service")
+operation_counter = meter.create_counter(
+    "togglemaster.targeting.operations",
+    unit="1",
+    description="Operações realizadas sobre regras de segmentação",
+)
+auth_counter = meter.create_counter(
+    "togglemaster.targeting.auth_checks",
+    unit="1",
+    description="Validações de autenticação solicitadas pelo targeting-service",
+)
 
 # --- Configuração ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -43,6 +61,7 @@ def require_auth(f):
     def decorated(*args, **kwargs):
         auth_header = request.headers.get("Authorization")
         if not auth_header:
+            auth_counter.add(1, {"auth.result": "missing_credentials"})
             return jsonify({"error": "Authorization header obrigatório"}), 401
 
         try:
@@ -50,15 +69,20 @@ def require_auth(f):
             response = requests.get(validate_url, headers={"Authorization": auth_header}, timeout=3)
 
             if response.status_code != 200:
+                auth_counter.add(1, {"auth.result": "invalid"})
                 log.warning(f"Falha na validação da chave (status: {response.status_code})")
                 return jsonify({"error": "Chave de API inválida"}), 401
 
+            auth_counter.add(1, {"auth.result": "valid"})
+
         except requests.exceptions.Timeout:
+            auth_counter.add(1, {"auth.result": "timeout"})
             log.error("Timeout ao conectar com o auth-service")
             return jsonify(
                 {"error": "Serviço de autenticação indisponível (timeout)"}
             ), 504  # Gateway Timeout
         except requests.exceptions.RequestException as e:
+            auth_counter.add(1, {"auth.result": "unavailable"})
             log.error(f"Erro ao conectar com o auth-service: {e}")
             return jsonify(
                 {"error": "Serviço de autenticação indisponível"}
@@ -67,6 +91,44 @@ def require_auth(f):
         return f(*args, **kwargs)
 
     return decorated
+
+
+def observe_targeting_operation(operation):
+    """Cria spans de negócio sem incluir o JSON das regras ou dados do usuário."""
+
+    def decorator(f):
+        @wraps(f)
+        def observed(*args, **kwargs):
+            with tracer.start_as_current_span(f"targeting_rule.{operation}") as span:
+                if "flag_name" in kwargs:
+                    span.set_attribute("feature_flag.name", kwargs["flag_name"])
+                try:
+                    response = f(*args, **kwargs)
+                    status_code = (
+                        response[1]
+                        if isinstance(response, tuple) and len(response) > 1
+                        else getattr(response, "status_code", 200)
+                    )
+                    span.set_attribute("targeting.operation", operation)
+                    span.set_attribute("http.response.status_code", status_code)
+                    operation_counter.add(
+                        1,
+                        {
+                            "targeting.operation": operation,
+                            "http.response.status_code": status_code,
+                        },
+                    )
+                    if status_code >= 500:
+                        span.set_status(Status(StatusCode.ERROR, "operation failed"))
+                    return response
+                except Exception as error:
+                    span.record_exception(error)
+                    span.set_status(Status(StatusCode.ERROR, "unhandled operation error"))
+                    raise
+
+        return observed
+
+    return decorator
 
 
 # --- Endpoints da API ---
@@ -79,6 +141,7 @@ def health():
 
 @app.route("/rules", methods=["POST"])
 @require_auth
+@observe_targeting_operation("create")
 def create_rule():
     """Cria uma nova regra de segmentação para uma flag"""
     data = request.get_json()
@@ -122,6 +185,7 @@ def create_rule():
 
 @app.route("/rules/<string:flag_name>", methods=["GET"])
 @require_auth
+@observe_targeting_operation("get")
 def get_rule(flag_name):
     """Busca uma regra de segmentação pelo nome da flag"""
     conn = None
@@ -146,6 +210,7 @@ def get_rule(flag_name):
 
 @app.route("/rules/<string:flag_name>", methods=["PUT"])
 @require_auth
+@observe_targeting_operation("update")
 def update_rule(flag_name):
     """Atualiza a regra de segmentação de uma flag"""
     data = request.get_json()
@@ -197,6 +262,7 @@ def update_rule(flag_name):
 
 @app.route("/rules/<string:flag_name>", methods=["DELETE"])
 @require_auth
+@observe_targeting_operation("delete")
 def delete_rule(flag_name):
     """Deleta a regra de segmentação de uma flag"""
     conn = None
